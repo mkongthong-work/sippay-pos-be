@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"pos-backend/db"
 	"pos-backend/models"
@@ -99,7 +100,9 @@ func RestoreCategory(c *gin.Context) {
 
 func ListMenuItems(c *gin.Context) {
 	var items []models.MenuItem
-	query := db.DB.Preload("Category").Preload("OptionGroups.Choices")
+	query := db.DB.Preload("Category").
+		Preload("OptionGroups", func(db *gorm.DB) *gorm.DB { return db.Order("sort_order asc") }).
+		Preload("OptionGroups.Choices", func(db *gorm.DB) *gorm.DB { return db.Order("sort_order asc") })
 	if categoryID := c.Query("category_id"); categoryID != "" {
 		if id, err := strconv.Atoi(categoryID); err == nil {
 			query = query.Where("category_id = ?", id)
@@ -302,7 +305,7 @@ func CreateOptionGroup(c *gin.Context) {
 		db.DB.Create(&choice)
 	}
 
-	db.DB.Preload("Choices").First(&group, group.ID)
+	orderedChoicesPreload(db.DB).First(&group, group.ID)
 	c.JSON(http.StatusCreated, group)
 }
 
@@ -361,7 +364,7 @@ func UpdateOptionGroup(c *gin.Context) {
 	}
 	db.DB.Save(&group)
 
-	db.DB.Preload("Choices").First(&group, group.ID)
+	orderedChoicesPreload(db.DB).First(&group, group.ID)
 	c.JSON(http.StatusOK, group)
 }
 
@@ -379,6 +382,7 @@ type addOptionChoiceRequest struct {
 	Name       string  `json:"name" binding:"required"`
 	PriceDelta float64 `json:"price_delta"`
 	IsDefault  bool    `json:"is_default"`
+	SortOrder  int     `json:"sort_order"`
 }
 
 func AddOptionChoice(c *gin.Context) {
@@ -399,6 +403,7 @@ func AddOptionChoice(c *gin.Context) {
 		PriceDelta:    req.PriceDelta,
 		IsDefault:     req.IsDefault,
 		IsEnabled:     true,
+		SortOrder:     req.SortOrder,
 	}
 	if err := db.DB.Create(&choice).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -412,6 +417,7 @@ type updateOptionChoiceRequest struct {
 	PriceDelta *float64 `json:"price_delta"`
 	IsDefault  *bool    `json:"is_default"`
 	IsEnabled  *bool    `json:"is_enabled"`
+	SortOrder  *int     `json:"sort_order"`
 }
 
 // UpdateOptionChoice แก้ไขตัวเลือกย่อยที่มีอยู่แล้ว (เช่น ติ๊ก "เริ่มต้น"/"เปิดใช้งาน" หรือแก้ราคา)
@@ -439,6 +445,9 @@ func UpdateOptionChoice(c *gin.Context) {
 	if req.IsEnabled != nil {
 		choice.IsEnabled = *req.IsEnabled
 	}
+	if req.SortOrder != nil {
+		choice.SortOrder = *req.SortOrder
+	}
 	db.DB.Save(&choice)
 	c.JSON(http.StatusOK, choice)
 }
@@ -456,11 +465,27 @@ func DeleteOptionChoice(c *gin.Context) {
 // ค่าเริ่มต้นของกลุ่มตัวเลือกที่ตั้งไว้ระดับหมวดหมู่ เช่น หมวด "กาแฟ" ตั้ง "ความหวาน" ไว้ครั้งเดียว
 // แล้วนำไป "ใช้" (apply) กับเมนูแต่ละอย่างในหมวดนั้นได้ โดย copy เป็น MenuOptionGroup ของเมนูนั้นจริงๆ
 
+// เรียง Choices ของแต่ละ template ตาม sort_order เสมอ ให้ลำดับที่ตั้งไว้ในหน้าฟอร์ม (ปุ่ม ▲▼) ตรงกับ
+// ลำดับที่โชว์เป็น chip ในการ์ดและตอนนำไป apply กับเมนู
+func orderedChoicesPreload(query *gorm.DB) *gorm.DB {
+	return query.Preload("Choices", func(db *gorm.DB) *gorm.DB {
+		return db.Order("sort_order asc")
+	})
+}
+
 // ListAllCategoryOptionTemplates คืนกลุ่มตัวเลือก (template) ของทุกหมวดหมู่รวมกัน — ใช้กับหน้าแท็บ
 // "ตัวเลือกเสริม" ที่โชว์เป็นการ์ดรวมทุกกลุ่มในที่เดียว ไม่ต้องเลือกหมวดหมู่ก่อนถึงจะเห็น
+// ไม่รวมกลุ่มที่เก็บถาวรไว้ (ดู ListArchivedCategoryOptionTemplates สำหรับแท็บ "เก็บถาวร")
 func ListAllCategoryOptionTemplates(c *gin.Context) {
 	var templates []models.CategoryOptionTemplate
-	db.DB.Preload("Choices").Order("sort_order asc").Find(&templates)
+	orderedChoicesPreload(db.DB).Where("is_archived = ?", false).Order("sort_order asc").Find(&templates)
+	c.JSON(http.StatusOK, templates)
+}
+
+// ListArchivedCategoryOptionTemplates คืนกลุ่มตัวเลือกที่ถูก "เก็บ" ไว้ — ใช้กับแท็บ "เก็บถาวร"
+func ListArchivedCategoryOptionTemplates(c *gin.Context) {
+	var templates []models.CategoryOptionTemplate
+	orderedChoicesPreload(db.DB).Where("is_archived = ?", true).Order("sort_order asc").Find(&templates)
 	c.JSON(http.StatusOK, templates)
 }
 
@@ -469,7 +494,7 @@ func ListAllCategoryOptionTemplates(c *gin.Context) {
 func ListCategoryOptionTemplates(c *gin.Context) {
 	categoryID := c.Param("id")
 	var templates []models.CategoryOptionTemplate
-	db.DB.Preload("Choices").Where("category_id = ?", categoryID).Find(&templates)
+	orderedChoicesPreload(db.DB).Where("category_id = ? AND is_archived = ?", categoryID, false).Find(&templates)
 	c.JSON(http.StatusOK, templates)
 }
 
@@ -540,7 +565,7 @@ func CreateCategoryOptionTemplate(c *gin.Context) {
 		db.DB.Create(&choice)
 	}
 
-	db.DB.Preload("Choices").First(&template, template.ID)
+	orderedChoicesPreload(db.DB).First(&template, template.ID)
 	c.JSON(http.StatusCreated, template)
 }
 
@@ -603,7 +628,7 @@ func UpdateCategoryOptionTemplate(c *gin.Context) {
 	}
 	db.DB.Save(&template)
 
-	db.DB.Preload("Choices").First(&template, template.ID)
+	orderedChoicesPreload(db.DB).First(&template, template.ID)
 	c.JSON(http.StatusOK, template)
 }
 
@@ -617,10 +642,38 @@ func DeleteCategoryOptionTemplate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
 }
 
+// ArchiveCategoryOptionTemplate เก็บกลุ่มตัวเลือกนี้ไว้ (ไม่ลบถาวร) — ไม่โชว์ในหน้า "ตัวเลือกเสริม" หลัก
+// อีกต่อไป แต่กู้คืนได้ภายหลังจากแท็บ "เก็บถาวร"
+func ArchiveCategoryOptionTemplate(c *gin.Context) {
+	id := c.Param("id")
+	var template models.CategoryOptionTemplate
+	if err := db.DB.First(&template, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "option template not found"})
+		return
+	}
+	template.IsArchived = true
+	db.DB.Save(&template)
+	c.JSON(http.StatusOK, template)
+}
+
+// RestoreCategoryOptionTemplate กู้คืนกลุ่มตัวเลือกที่เก็บถาวรไว้กลับมาใช้งานปกติ
+func RestoreCategoryOptionTemplate(c *gin.Context) {
+	id := c.Param("id")
+	var template models.CategoryOptionTemplate
+	if err := db.DB.First(&template, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "option template not found"})
+		return
+	}
+	template.IsArchived = false
+	db.DB.Save(&template)
+	c.JSON(http.StatusOK, template)
+}
+
 type addTemplateChoiceRequest struct {
 	Name       string  `json:"name" binding:"required"`
 	PriceDelta float64 `json:"price_delta"`
 	IsDefault  bool    `json:"is_default"`
+	SortOrder  int     `json:"sort_order"`
 }
 
 // AddCategoryOptionTemplateChoice เพิ่มตัวเลือกย่อยใหม่เข้ากลุ่ม template ที่มีอยู่แล้ว
@@ -642,6 +695,7 @@ func AddCategoryOptionTemplateChoice(c *gin.Context) {
 		PriceDelta: req.PriceDelta,
 		IsDefault:  req.IsDefault,
 		IsEnabled:  true,
+		SortOrder:  req.SortOrder,
 	}
 	if err := db.DB.Create(&choice).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -655,6 +709,7 @@ type updateTemplateChoiceRequest struct {
 	PriceDelta *float64 `json:"price_delta"`
 	IsDefault  *bool    `json:"is_default"`
 	IsEnabled  *bool    `json:"is_enabled"`
+	SortOrder  *int     `json:"sort_order"`
 }
 
 // UpdateCategoryOptionTemplateChoice แก้ไขตัวเลือกย่อยของ template ที่มีอยู่แล้ว
@@ -682,6 +737,9 @@ func UpdateCategoryOptionTemplateChoice(c *gin.Context) {
 	if req.IsEnabled != nil {
 		choice.IsEnabled = *req.IsEnabled
 	}
+	if req.SortOrder != nil {
+		choice.SortOrder = *req.SortOrder
+	}
 	db.DB.Save(&choice)
 	c.JSON(http.StatusOK, choice)
 }
@@ -708,7 +766,7 @@ func ApplyOptionTemplateToMenuItem(c *gin.Context) {
 	}
 
 	var template models.CategoryOptionTemplate
-	if err := db.DB.Preload("Choices").First(&template, templateID).Error; err != nil {
+	if err := orderedChoicesPreload(db.DB).First(&template, templateID).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "option template not found"})
 		return
 	}
@@ -746,6 +804,6 @@ func ApplyOptionTemplateToMenuItem(c *gin.Context) {
 		db.DB.Create(&choice)
 	}
 
-	db.DB.Preload("Choices").First(&group, group.ID)
+	orderedChoicesPreload(db.DB).First(&group, group.ID)
 	c.JSON(http.StatusCreated, group)
 }

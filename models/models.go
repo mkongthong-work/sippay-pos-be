@@ -74,6 +74,7 @@ type CategoryOptionTemplate struct {
 	MaxSelect     int                            `json:"max_select" gorm:"default:1"`
 	IsRequired    bool                           `json:"is_required" gorm:"default:true"`
 	IsEnabled     bool                           `json:"is_enabled" gorm:"not null;default:true"`
+	IsArchived    bool                           `json:"is_archived" gorm:"not null;default:false"`
 	SortOrder     int                            `json:"sort_order"`
 	Choices       []CategoryOptionTemplateChoice `json:"choices,omitempty" gorm:"foreignKey:TemplateID"`
 }
