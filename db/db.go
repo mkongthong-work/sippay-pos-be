@@ -24,7 +24,15 @@ func Init(path string) {
 	var err error
 
 	if dsn := os.Getenv("DATABASE_URL"); dsn != "" {
-		database, err = gorm.Open(postgres.Open(dsn), &gorm.Config{})
+		// PreferSimpleProtocol: true — ปิดการใช้ prepared statement ของ pgx driver จำเป็นมากตอนต่อผ่าน
+		// Supabase Transaction pooler (pgbouncer โหมด transaction) เพราะ pooler แชร์ connection ข้าม
+		// request กัน ถ้าปล่อยให้ driver แคช prepared statement ไว้ที่ session จะชนกันจน error
+		// "prepared statement ... already exists" (SQLSTATE 42P05) แบบที่เจอ — ปิดแล้วทุกคำสั่งจะส่งเป็น
+		// simple query แทน ช้าลงนิดหน่อยแต่ทำงานถูกต้องกับ pooler แบบนี้
+		database, err = gorm.Open(postgres.New(postgres.Config{
+			DSN:                  dsn,
+			PreferSimpleProtocol: true,
+		}), &gorm.Config{})
 	} else {
 		database, err = gorm.Open(sqlite.Open(path), &gorm.Config{})
 	}
