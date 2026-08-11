@@ -13,13 +13,36 @@ import (
 
 var DB *gorm.DB
 
-// Init เชื่อมต่อฐานข้อมูลและสร้างตารางอัตโนมัติตาม struct ใน models
+var allModels = []interface{}{
+	&models.User{},
+	&models.Category{},
+	&models.CategoryOptionTemplate{},
+	&models.CategoryOptionTemplateChoice{},
+	&models.MenuItem{},
+	&models.MenuOptionGroup{},
+	&models.MenuOptionChoice{},
+	&models.DiningTable{},
+	&models.Zone{},
+	&models.Reservation{},
+	&models.Order{},
+	&models.OrderItem{},
+	&models.OrderItemOption{},
+	&models.Payment{},
+	&models.InvoiceCounter{},
+	&models.ShopSettings{},
+	&models.Member{},
+	&models.MemberPointHistory{},
+	&models.LoyaltySettings{},
+}
+
+// Connect เชื่อมต่อฐานข้อมูลอย่างเดียว (ไม่ migrate/seed) — เร็ว ใช้เรียกได้ทุก cold start ของ
+// serverless function โดยไม่เสี่ยง timeout
 //   - ถ้าตั้ง env DATABASE_URL ไว้ (เช่น connection string ของ Supabase Postgres) → ใช้ Postgres
 //     แนะนำให้ใช้ connection string จาก "Transaction pooler" ของ Supabase (พอร์ต 6543) ไม่ใช่พอร์ตตรง
 //     5432 เพราะ backend รันเป็น serverless function บน Vercel แต่ละ request อาจเป็นคนละ process กัน
 //     ถ้าต่อพอร์ตตรงจะเปิด connection ค้างจนเกินโควตาของ Postgres ได้ง่ายมาก
 //   - ถ้าไม่ได้ตั้ง (รันเองบนเครื่อง/VM ปกติ) → ใช้ไฟล์ SQLite ตาม path ที่รับมาเหมือนเดิม
-func Init(path string) {
+func Connect(path string) {
 	var database *gorm.DB
 	var err error
 
@@ -27,8 +50,7 @@ func Init(path string) {
 		// PreferSimpleProtocol: true — ปิดการใช้ prepared statement ของ pgx driver จำเป็นมากตอนต่อผ่าน
 		// Supabase Transaction pooler (pgbouncer โหมด transaction) เพราะ pooler แชร์ connection ข้าม
 		// request กัน ถ้าปล่อยให้ driver แคช prepared statement ไว้ที่ session จะชนกันจน error
-		// "prepared statement ... already exists" (SQLSTATE 42P05) แบบที่เจอ — ปิดแล้วทุกคำสั่งจะส่งเป็น
-		// simple query แทน ช้าลงนิดหน่อยแต่ทำงานถูกต้องกับ pooler แบบนี้
+		// "prepared statement ... already exists" (SQLSTATE 42P05)
 		database, err = gorm.Open(postgres.New(postgres.Config{
 			DSN:                  dsn,
 			PreferSimpleProtocol: true,
@@ -40,32 +62,18 @@ func Init(path string) {
 		log.Fatalf("failed to connect database: %v", err)
 	}
 
-	err = database.AutoMigrate(
-		&models.User{},
-		&models.Category{},
-		&models.CategoryOptionTemplate{},
-		&models.CategoryOptionTemplateChoice{},
-		&models.MenuItem{},
-		&models.MenuOptionGroup{},
-		&models.MenuOptionChoice{},
-		&models.DiningTable{},
-		&models.Zone{},
-		&models.Reservation{},
-		&models.Order{},
-		&models.OrderItem{},
-		&models.OrderItemOption{},
-		&models.Payment{},
-		&models.InvoiceCounter{},
-		&models.ShopSettings{},
-		&models.Member{},
-		&models.MemberPointHistory{},
-		&models.LoyaltySettings{},
-	)
-	if err != nil {
+	DB = database
+}
+
+// Migrate สร้าง/อัปเดตตารางอัตโนมัติตาม struct ใน models + seed ค่าเริ่มต้น (ShopSettings, LoyaltySettings,
+// Zone) — ช้า (แต่ละ query ผ่าน pooler ของ Supabase มี latency ~200ms และมีตารางเยอะ) ห้ามเรียกทุก cold
+// start ของ Vercel serverless function เด็ดขาด เพราะ Vercel จำกัดเวลา boot function ไว้ 30 วินาที เรียกครั้ง
+// เดียวตอน deploy/ตั้งค่าฐานข้อมูลครั้งแรกพอ (ดู cmd/migrate) — bootstrap.Init() เรียกให้อัตโนมัติเฉพาะตอนรัน
+// เป็นเซิร์ฟเวอร์ปกติ (ไม่ใช่ Vercel) เท่านั้น
+func Migrate() {
+	if err := DB.AutoMigrate(allModels...); err != nil {
 		log.Fatalf("failed to migrate database: %v", err)
 	}
-
-	DB = database
 
 	backfillZonesFromTables()
 	ensureShopSettings()
