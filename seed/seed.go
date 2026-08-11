@@ -20,7 +20,7 @@ func Run() {
 	log.Println("seeding initial data...")
 
 	hash, _ := bcrypt.GenerateFromPassword([]byte("admin1234"), bcrypt.DefaultCost)
-	admin := models.User{Username: "admin", PasswordHash: string(hash), Name: "Admin", Role: "admin"}
+	admin := models.User{Username: "admin", PasswordHash: string(hash), Name: "Admin", Role: "admin", IsActive: true}
 	db.DB.Create(&admin)
 
 	coffee := models.Category{Name: "กาแฟ/เครื่องดื่ม", SortOrder: 1}

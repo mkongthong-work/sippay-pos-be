@@ -27,6 +27,7 @@ type createOrderRequest struct {
 	OrderType  string           `json:"order_type" binding:"required,oneof=dine_in takeaway"`
 	TableID    *uint            `json:"table_id"`
 	GuestCount int              `json:"guest_count"`
+	Note       string           `json:"note"`
 	Items      []orderItemInput `json:"items" binding:"required,min=1"`
 }
 
@@ -59,13 +60,16 @@ func buildOrderItem(tx *gorm.DB, orderID uint, in orderItemInput) (models.OrderI
 		return models.OrderItem{}, errors.New("menu item not found")
 	}
 
-	// จับคู่ choice ที่เลือกมากับกลุ่มของมัน (สมมติเลือกได้กลุ่มละ 1 ตัวเลือก)
-	chosenByGroup := map[uint]models.MenuOptionChoice{}
+	// จับคู่ choice ที่เลือกมากับกลุ่มของมัน — กลุ่มหนึ่งเลือกได้หลายตัวเลือกพร้อมกันได้ถ้าเป็นกลุ่มแบบ
+	// multi-select (MaxSelect > 1) จึงเก็บเป็น slice ต่อกลุ่ม ไม่ใช่ค่าเดียว (เดิมเก็บแบบค่าเดียวทำให้
+	// ถ้าเลือกหลายตัวเลือกในกลุ่มเดียวกัน ตัวที่เลือกไว้จะถูกทับเหลือแค่ตัวสุดท้าย ราคา/ตัวเลือกที่บันทึกจึง
+	// ขาดหายไปจากที่หน้าขายคำนวณไว้)
+	chosenByGroup := map[uint][]models.MenuOptionChoice{}
 	for _, group := range menuItem.OptionGroups {
 		for _, choice := range group.Choices {
 			for _, id := range in.OptionChoiceIDs {
 				if choice.ID == id {
-					chosenByGroup[group.ID] = choice
+					chosenByGroup[group.ID] = append(chosenByGroup[group.ID], choice)
 				}
 			}
 		}
@@ -73,15 +77,17 @@ func buildOrderItem(tx *gorm.DB, orderID uint, in orderItemInput) (models.OrderI
 
 	for _, group := range menuItem.OptionGroups {
 		if group.IsRequired {
-			if _, ok := chosenByGroup[group.ID]; !ok {
+			if len(chosenByGroup[group.ID]) == 0 {
 				return models.OrderItem{}, fmt.Errorf("please select an option for %s", group.Name)
 			}
 		}
 	}
 
 	unitPrice := menuItem.Price
-	for _, choice := range chosenByGroup {
-		unitPrice += choice.PriceDelta
+	for _, choices := range chosenByGroup {
+		for _, choice := range choices {
+			unitPrice += choice.PriceDelta
+		}
 	}
 
 	orderItem := models.OrderItem{
@@ -98,19 +104,21 @@ func buildOrderItem(tx *gorm.DB, orderID uint, in orderItemInput) (models.OrderI
 	}
 
 	for _, group := range menuItem.OptionGroups {
-		choice, ok := chosenByGroup[group.ID]
+		choices, ok := chosenByGroup[group.ID]
 		if !ok {
 			continue
 		}
-		option := models.OrderItemOption{
-			OrderItemID:   orderItem.ID,
-			OptionGroupID: group.ID,
-			GroupName:     group.Name,
-			ChoiceID:      choice.ID,
-			ChoiceName:    choice.Name,
-			PriceDelta:    choice.PriceDelta,
+		for _, choice := range choices {
+			option := models.OrderItemOption{
+				OrderItemID:   orderItem.ID,
+				OptionGroupID: group.ID,
+				GroupName:     group.Name,
+				ChoiceID:      choice.ID,
+				ChoiceName:    choice.Name,
+				PriceDelta:    choice.PriceDelta,
+			}
+			tx.Create(&option)
 		}
-		tx.Create(&option)
 	}
 
 	return orderItem, nil
@@ -158,6 +166,7 @@ func CreateOrder(c *gin.Context) {
 		OrderType:  req.OrderType,
 		TableID:    req.TableID,
 		GuestCount: req.GuestCount,
+		Note:       req.Note,
 		Status:     "open",
 		CreatedBy:  userID.(uint),
 	}
@@ -179,13 +188,18 @@ func CreateOrder(c *gin.Context) {
 
 	if req.OrderType == "dine_in" && req.TableID != nil {
 		tx.Model(&models.DiningTable{}).Where("id = ?", *req.TableID).Update("status", "occupied")
+		// ถ้าโต๊ะนี้มีรายการจอง/กันโต๊ะที่ยัง active อยู่ ให้ปิดเป็น seated พร้อมผูก order นี้ให้อัตโนมัติ
+		// (พนักงานแค่เลือกโต๊ะที่จองไว้แล้วเปิดบิลตามปกติ ไม่ต้องมากดปิด reservation เองอีกขั้นตอน)
+		tx.Model(&models.Reservation{}).
+			Where("table_id = ? AND status = ?", *req.TableID, "active").
+			Updates(map[string]interface{}{"status": "seated", "order_id": order.ID})
 	}
 
 	tx.Commit()
 
 	recalcTotal(order.ID)
 
-	db.DB.Preload("Items.MenuItem").Preload("Items.Options").Preload("Table").First(&order, order.ID)
+	db.DB.Preload("Items.MenuItem").Preload("Items.Options").Preload("Table").Preload("CreatedByUser").First(&order, order.ID)
 	c.JSON(http.StatusCreated, order)
 }
 
@@ -197,6 +211,8 @@ func ListOrders(c *gin.Context) {
 		Preload("Items.Options").
 		Preload("Table").
 		Preload("Payment").
+		Preload("Payment.PaidByUser").
+		Preload("CreatedByUser").
 		Order("created_at desc")
 	if statusParam := c.Query("status"); statusParam != "" {
 		statuses := strings.Split(statusParam, ",")
@@ -224,6 +240,8 @@ func GetOrder(c *gin.Context) {
 		Preload("Items.Options").
 		Preload("Table").
 		Preload("Payment").
+		Preload("Payment.PaidByUser").
+		Preload("CreatedByUser").
 		First(&order, id).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "order not found"})
 		return
@@ -411,7 +429,10 @@ func UpdateOrderStatus(c *gin.Context) {
 	order.Status = req.Status
 	db.DB.Save(&order)
 
-	if req.Status == "cancelled" && order.TableID != nil {
+	// ปิดบิลไม่ว่าจะด้วยการจ่ายเงินหรือยกเลิก ต้องปล่อยโต๊ะกลับมาว่างเสมอ (จุดนี้เป็นทางแก้ไขสถานะแบบทั่วไป
+	// แยกจาก PayOrder ที่ปล่อยโต๊ะให้อยู่แล้วตอนจ่ายเงินผ่านหน้าคิดเงินปกติ — เผื่อมีการเรียก endpoint นี้ตรงๆ
+	// เพื่อตั้งสถานะเป็น paid ก็ต้องปล่อยโต๊ะเหมือนกัน ไม่งั้นโต๊ะจะค้างสถานะไม่ว่างทั้งที่บิลปิดไปแล้ว)
+	if (req.Status == "cancelled" || req.Status == "paid") && order.TableID != nil {
 		db.DB.Model(&models.DiningTable{}).Where("id = ?", *order.TableID).Update("status", "available")
 	}
 
@@ -443,6 +464,79 @@ func UpdateOrderGuestCount(c *gin.Context) {
 
 	order.GuestCount = req.GuestCount
 	db.DB.Save(&order)
+	c.JSON(http.StatusOK, order)
+}
+
+type changeOrderTableRequest struct {
+	TableID uint `json:"table_id" binding:"required"`
+}
+
+// ChangeOrderTable ย้ายออเดอร์นั่งทานที่เปิดอยู่ไปยังโต๊ะอื่น เช่น ลูกค้านั่งอยู่แล้วอยากย้ายที่นั่ง
+// โต๊ะเดิมจะถูกปล่อยกลับเป็นว่าง โต๊ะใหม่ต้องว่างอยู่ก่อนถึงจะย้ายได้
+func ChangeOrderTable(c *gin.Context) {
+	id := c.Param("id")
+	var order models.Order
+	if err := db.DB.First(&order, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "order not found"})
+		return
+	}
+	if order.OrderType != "dine_in" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ย้ายโต๊ะได้เฉพาะออเดอร์นั่งทานเท่านั้น"})
+		return
+	}
+	if order.Status == "paid" || order.Status == "cancelled" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot modify a paid or cancelled order"})
+		return
+	}
+
+	var req changeOrderTableRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if order.TableID != nil && *order.TableID == req.TableID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "โต๊ะนี้เป็นโต๊ะเดิมของบิลนี้อยู่แล้ว"})
+		return
+	}
+
+	var newTable models.DiningTable
+	if err := db.DB.First(&newTable, req.TableID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "table not found"})
+		return
+	}
+	if newTable.Status != "available" {
+		c.JSON(http.StatusConflict, gin.H{"error": "โต๊ะใหม่ไม่ว่าง เลือกโต๊ะอื่นแทน"})
+		return
+	}
+
+	oldTableID := order.TableID
+
+	tx := db.DB.Begin()
+	if err := tx.Model(&order).Update("table_id", req.TableID).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if err := tx.Model(&models.DiningTable{}).Where("id = ?", req.TableID).Update("status", "occupied").Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if oldTableID != nil {
+		if err := tx.Model(&models.DiningTable{}).Where("id = ?", *oldTableID).Update("status", "available").Error; err != nil {
+			tx.Rollback()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	tx.Commit()
+
+	db.DB.
+		Preload("Items.MenuItem").
+		Preload("Items.Options").
+		Preload("Table").
+		Preload("CreatedByUser").
+		First(&order, order.ID)
 	c.JSON(http.StatusOK, order)
 }
 
@@ -490,13 +584,15 @@ func UpdateOrderDiscount(c *gin.Context) {
 
 	recalcTotal(order.ID)
 
-	db.DB.Preload("Items.MenuItem").Preload("Items.Options").Preload("Table").First(&order, order.ID)
+	db.DB.Preload("Items.MenuItem").Preload("Items.Options").Preload("Table").Preload("CreatedByUser").First(&order, order.ID)
 	c.JSON(http.StatusOK, order)
 }
 
 type payOrderRequest struct {
-	Method         string  `json:"method" binding:"required"`
+	Method         string  `json:"method" binding:"required,oneof=cash transfer"`
 	ReceivedAmount float64 `json:"received_amount"`
+	// TransferRef ใช้เฉพาะ method=transfer เป็นเลขอ้างอิงการโอน (ไม่บังคับ ไม่ใส่ก็ปิดบิลได้ มาเติมทีหลังได้)
+	TransferRef string `json:"transfer_ref"`
 }
 
 func PayOrder(c *gin.Context) {
@@ -518,9 +614,27 @@ func PayOrder(c *gin.Context) {
 	}
 
 	userID, _ := c.Get("user_id")
-	change := req.ReceivedAmount - order.TotalAmount
+
+	// โอนเงินถือว่าลูกค้าโอนมาพอดียอด ไม่มีเงินทอน (ตัวเลขที่ frontend ส่งมาถ้ามีจะถูกมองข้าม กันพลาดคำนวณผิด)
+	receivedAmount := req.ReceivedAmount
+	if req.Method == "transfer" {
+		receivedAmount = order.TotalAmount
+	}
+	change := receivedAmount - order.TotalAmount
 	if change < 0 {
 		change = 0
+	}
+
+	// ปิดบิล + ออกเลขที่ใบเสร็จ (invoice_no) พร้อมกันในทรานแซกชันเดียว กันเลขที่บิลซ้ำ/กระโดดถ้ามีการ
+	// ปิดบิลพร้อมกันหลายบิล (ดู generateInvoiceNo ใน handlers/invoice.go) — ถ้าขั้นตอนไหนพลาด ต้อง rollback
+	// ทั้งหมด ไม่ให้ค้างเป็นบิลจ่ายแล้วแต่ไม่มีเลขที่ใบเสร็จ
+	tx := db.DB.Begin()
+
+	invoiceNo, err := generateInvoiceNo(tx)
+	if err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "ออกเลขที่ใบเสร็จไม่สำเร็จ"})
+		return
 	}
 
 	payment := models.Payment{
@@ -529,20 +643,39 @@ func PayOrder(c *gin.Context) {
 		Subtotal:       order.Subtotal,
 		DiscountAmount: order.DiscountAmount,
 		Amount:         order.TotalAmount,
-		ReceivedAmount: req.ReceivedAmount,
+		ReceivedAmount: receivedAmount,
 		ChangeAmount:   change,
+		TransferRef:    req.TransferRef,
 		PaidBy:         userID.(uint),
 		PaidAt:         time.Now(),
+		InvoiceNo:      invoiceNo,
 	}
-	db.DB.Create(&payment)
+	if err := tx.Create(&payment).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 
 	order.Status = "paid"
-	db.DB.Save(&order)
-
-	if order.TableID != nil {
-		db.DB.Model(&models.DiningTable{}).Where("id = ?", *order.TableID).Update("status", "available")
+	if err := tx.Save(&order).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
 
-	db.DB.Preload("Items.MenuItem").Preload("Items.Options").Preload("Table").Preload("Payment").First(&order, order.ID)
+	if order.TableID != nil {
+		tx.Model(&models.DiningTable{}).Where("id = ?", *order.TableID).Update("status", "available")
+	}
+
+	tx.Commit()
+
+	db.DB.
+		Preload("Items.MenuItem").
+		Preload("Items.Options").
+		Preload("Table").
+		Preload("Payment").
+		Preload("Payment.PaidByUser").
+		Preload("CreatedByUser").
+		First(&order, order.ID)
 	c.JSON(http.StatusOK, order)
 }

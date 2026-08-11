@@ -5,6 +5,9 @@
 *.db
 *.db-journal
 
+# ---- รูปสลิปโอนเงินที่พนักงานอัปโหลด (ข้อมูลจริงของร้าน ไม่ควรอยู่ใน repo) ----
+uploads/
+
 # ---- Go build artifacts ----
 pos-backend
 tmp/

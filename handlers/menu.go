@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -8,13 +9,18 @@ import (
 
 	"pos-backend/db"
 	"pos-backend/models"
+	"pos-backend/utils"
 )
 
 // ---- Categories ----
 
 func ListCategories(c *gin.Context) {
 	var categories []models.Category
-	db.DB.Order("sort_order asc").Find(&categories)
+	query := db.DB.Order("sort_order asc")
+	if c.Query("include_archived") != "true" {
+		query = query.Where("is_archived = ?", false)
+	}
+	query.Find(&categories)
 	c.JSON(http.StatusOK, categories)
 }
 
@@ -44,8 +50,12 @@ func UpdateCategory(c *gin.Context) {
 		return
 	}
 	cat.Name = input.Name
+	cat.Description = input.Description
+	cat.Color = input.Color
 	cat.SortOrder = input.SortOrder
-	cat.Station = input.Station
+	cat.IsEnabled = input.IsEnabled
+	// Station เจตนาไม่รับค่าจาก UI ใหม่แล้ว (หน้าจัดการเมนูรุ่นใหม่ไม่มีช่องนี้) แต่ยังคงค่าที่เคยตั้งไว้เดิม
+	// ไม่ต้อง overwrite ด้วย input.Station เพราะ input จะเป็นค่าว่างเสมอจาก frontend รุ่นใหม่
 	db.DB.Save(&cat)
 	c.JSON(http.StatusOK, cat)
 }
@@ -59,6 +69,32 @@ func DeleteCategory(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
 }
 
+// ArchiveCategory เก็บหมวดหมู่เข้าคลังเก็บถาวร (ซ่อนจากรายการหลัก แต่กู้คืนได้ ต่างจากลบถาวร)
+func ArchiveCategory(c *gin.Context) {
+	id := c.Param("id")
+	var cat models.Category
+	if err := db.DB.First(&cat, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "category not found"})
+		return
+	}
+	cat.IsArchived = true
+	db.DB.Save(&cat)
+	c.JSON(http.StatusOK, cat)
+}
+
+// RestoreCategory กู้คืนหมวดหมู่ที่เก็บถาวรไว้กลับมาใช้งานปกติ
+func RestoreCategory(c *gin.Context) {
+	id := c.Param("id")
+	var cat models.Category
+	if err := db.DB.First(&cat, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "category not found"})
+		return
+	}
+	cat.IsArchived = false
+	db.DB.Save(&cat)
+	c.JSON(http.StatusOK, cat)
+}
+
 // ---- Menu Items ----
 
 func ListMenuItems(c *gin.Context) {
@@ -68,6 +104,9 @@ func ListMenuItems(c *gin.Context) {
 		if id, err := strconv.Atoi(categoryID); err == nil {
 			query = query.Where("category_id = ?", id)
 		}
+	}
+	if c.Query("include_archived") != "true" {
+		query = query.Where("is_archived = ?", false)
 	}
 	query.Find(&items)
 	c.JSON(http.StatusOK, items)
@@ -102,6 +141,9 @@ func UpdateMenuItem(c *gin.Context) {
 	item.Price = input.Price
 	item.CategoryID = input.CategoryID
 	item.IsAvailable = input.IsAvailable
+	item.IsFeatured = input.IsFeatured
+	item.IsBestseller = input.IsBestseller
+	item.TrackStock = input.TrackStock
 	db.DB.Save(&item)
 	c.JSON(http.StatusOK, item)
 }
@@ -115,17 +157,94 @@ func DeleteMenuItem(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
 }
 
+// ArchiveMenuItem เก็บเมนูเข้าคลังเก็บถาวร (ซ่อนจากรายการหลัก แต่กู้คืนได้ ต่างจากลบถาวร)
+func ArchiveMenuItem(c *gin.Context) {
+	id := c.Param("id")
+	var item models.MenuItem
+	if err := db.DB.First(&item, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "menu item not found"})
+		return
+	}
+	item.IsArchived = true
+	db.DB.Save(&item)
+	c.JSON(http.StatusOK, item)
+}
+
+// RestoreMenuItem กู้คืนเมนูที่เก็บถาวรไว้กลับมาใช้งานปกติ
+func RestoreMenuItem(c *gin.Context) {
+	id := c.Param("id")
+	var item models.MenuItem
+	if err := db.DB.First(&item, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "menu item not found"})
+		return
+	}
+	item.IsArchived = false
+	db.DB.Save(&item)
+	c.JSON(http.StatusOK, item)
+}
+
+// UploadMenuItemImage อัปโหลด/แทนที่รูปของเมนูนี้ (multipart form field ชื่อ "image")
+// รูปแบบเดียวกับ UpdatePaymentSlip (handlers/payment.go) — เก็บไฟล์แบบสุ่มชื่อกันเดา URL แล้วเซฟ path/URL ไว้
+// ในฟิลด์ (utils.SaveUpload สลับเก็บดิสก์เอง/Supabase Storage ให้อัตโนมัติตาม env — ดู utils/storage.go)
+func UploadMenuItemImage(c *gin.Context) {
+	id := c.Param("id")
+	var item models.MenuItem
+	if err := db.DB.First(&item, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "menu item not found"})
+		return
+	}
+
+	file, err := c.FormFile("image")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "ไม่พบไฟล์รูปภาพ (field 'image')"})
+		return
+	}
+
+	imagePath, err := utils.SaveUpload(file, "menu-items", fmt.Sprintf("menuitem_%s", id))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	item.ImagePath = imagePath
+	db.DB.Save(&item)
+	c.JSON(http.StatusOK, item)
+}
+
+// DeleteMenuItemImage ลบรูปเมนูออก (ล้างฟิลด์ path เฉยๆ ไม่ได้ลบไฟล์จริงบนดิสก์)
+func DeleteMenuItemImage(c *gin.Context) {
+	id := c.Param("id")
+	var item models.MenuItem
+	if err := db.DB.First(&item, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "menu item not found"})
+		return
+	}
+	item.ImagePath = ""
+	db.DB.Save(&item)
+	c.JSON(http.StatusOK, item)
+}
+
 // ---- Menu Option Groups / Choices ----
 // ตัวเลือกของเมนู เช่น "ความหวาน" (หวานน้อย/หวานปกติ/หวานมาก), "ไซส์" ฯลฯ
 // ตั้งค่าได้ตอนสร้าง/แก้ไขเมนู แล้วจะไปโผล่ให้เลือกตอนสั่งที่หน้าขาย
 
+type optionChoiceInput struct {
+	Name       string  `json:"name" binding:"required"`
+	PriceDelta float64 `json:"price_delta"`
+	IsDefault  bool    `json:"is_default"`
+	IsEnabled  bool    `json:"is_enabled"`
+}
+
 type createOptionGroupRequest struct {
-	Name       string `json:"name" binding:"required"`
-	IsRequired bool   `json:"is_required"`
-	Choices    []struct {
-		Name       string  `json:"name" binding:"required"`
-		PriceDelta float64 `json:"price_delta"`
-	} `json:"choices" binding:"required,min=1"`
+	Name          string               `json:"name" binding:"required"`
+	Description   string               `json:"description"`
+	SelectionType string               `json:"selection_type"`
+	MinSelect     int                  `json:"min_select"`
+	MaxSelect     int                  `json:"max_select"`
+	IsRequired    bool                 `json:"is_required"`
+	IsEnabled     bool                 `json:"is_enabled"`
+	SortOrder     int                  `json:"sort_order"`
+	Choices       []optionChoiceInput  `json:"choices" binding:"required,min=1"`
 }
 
 func CreateOptionGroup(c *gin.Context) {
@@ -142,10 +261,29 @@ func CreateOptionGroup(c *gin.Context) {
 		return
 	}
 
+	selectionType := req.SelectionType
+	if selectionType != "multi" {
+		selectionType = "single"
+	}
+	maxSelect := req.MaxSelect
+	if maxSelect <= 0 {
+		if selectionType == "multi" {
+			maxSelect = len(req.Choices)
+		} else {
+			maxSelect = 1
+		}
+	}
+
 	group := models.MenuOptionGroup{
-		MenuItemID: menuItem.ID,
-		Name:       req.Name,
-		IsRequired: req.IsRequired,
+		MenuItemID:    menuItem.ID,
+		Name:          req.Name,
+		Description:   req.Description,
+		SelectionType: selectionType,
+		MinSelect:     req.MinSelect,
+		MaxSelect:     maxSelect,
+		IsRequired:    req.IsRequired,
+		IsEnabled:     true,
+		SortOrder:     req.SortOrder,
 	}
 	if err := db.DB.Create(&group).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -158,6 +296,8 @@ func CreateOptionGroup(c *gin.Context) {
 			Name:          ch.Name,
 			PriceDelta:    ch.PriceDelta,
 			SortOrder:     i,
+			IsDefault:     ch.IsDefault,
+			IsEnabled:     true,
 		}
 		db.DB.Create(&choice)
 	}
@@ -167,11 +307,17 @@ func CreateOptionGroup(c *gin.Context) {
 }
 
 type updateOptionGroupRequest struct {
-	Name       *string `json:"name"`
-	IsRequired *bool   `json:"is_required"`
+	Name          *string `json:"name"`
+	Description   *string `json:"description"`
+	SelectionType *string `json:"selection_type"`
+	MinSelect     *int    `json:"min_select"`
+	MaxSelect     *int    `json:"max_select"`
+	IsRequired    *bool   `json:"is_required"`
+	IsEnabled     *bool   `json:"is_enabled"`
+	SortOrder     *int    `json:"sort_order"`
 }
 
-// UpdateOptionGroup แก้ชื่อ/บังคับให้เลือกของกลุ่มตัวเลือกที่มีอยู่แล้ว (เช่น เปลี่ยนจาก "ต้องเลือก" เป็น "ไม่บังคับ")
+// UpdateOptionGroup แก้ไขกลุ่มตัวเลือกที่มีอยู่แล้ว (ส่งเฉพาะฟิลด์ที่อยากแก้ ฟิลด์ที่ไม่ส่งจะคงค่าเดิม)
 func UpdateOptionGroup(c *gin.Context) {
 	id := c.Param("id")
 	var group models.MenuOptionGroup
@@ -188,8 +334,30 @@ func UpdateOptionGroup(c *gin.Context) {
 	if req.Name != nil {
 		group.Name = *req.Name
 	}
+	if req.Description != nil {
+		group.Description = *req.Description
+	}
+	if req.SelectionType != nil {
+		if *req.SelectionType == "multi" {
+			group.SelectionType = "multi"
+		} else {
+			group.SelectionType = "single"
+		}
+	}
+	if req.MinSelect != nil {
+		group.MinSelect = *req.MinSelect
+	}
+	if req.MaxSelect != nil {
+		group.MaxSelect = *req.MaxSelect
+	}
 	if req.IsRequired != nil {
 		group.IsRequired = *req.IsRequired
+	}
+	if req.IsEnabled != nil {
+		group.IsEnabled = *req.IsEnabled
+	}
+	if req.SortOrder != nil {
+		group.SortOrder = *req.SortOrder
 	}
 	db.DB.Save(&group)
 
@@ -210,6 +378,7 @@ func DeleteOptionGroup(c *gin.Context) {
 type addOptionChoiceRequest struct {
 	Name       string  `json:"name" binding:"required"`
 	PriceDelta float64 `json:"price_delta"`
+	IsDefault  bool    `json:"is_default"`
 }
 
 func AddOptionChoice(c *gin.Context) {
@@ -228,12 +397,50 @@ func AddOptionChoice(c *gin.Context) {
 		OptionGroupID: group.ID,
 		Name:          req.Name,
 		PriceDelta:    req.PriceDelta,
+		IsDefault:     req.IsDefault,
+		IsEnabled:     true,
 	}
 	if err := db.DB.Create(&choice).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusCreated, choice)
+}
+
+type updateOptionChoiceRequest struct {
+	Name       *string  `json:"name"`
+	PriceDelta *float64 `json:"price_delta"`
+	IsDefault  *bool    `json:"is_default"`
+	IsEnabled  *bool    `json:"is_enabled"`
+}
+
+// UpdateOptionChoice แก้ไขตัวเลือกย่อยที่มีอยู่แล้ว (เช่น ติ๊ก "เริ่มต้น"/"เปิดใช้งาน" หรือแก้ราคา)
+func UpdateOptionChoice(c *gin.Context) {
+	id := c.Param("id")
+	var choice models.MenuOptionChoice
+	if err := db.DB.First(&choice, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "choice not found"})
+		return
+	}
+	var req updateOptionChoiceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Name != nil {
+		choice.Name = *req.Name
+	}
+	if req.PriceDelta != nil {
+		choice.PriceDelta = *req.PriceDelta
+	}
+	if req.IsDefault != nil {
+		choice.IsDefault = *req.IsDefault
+	}
+	if req.IsEnabled != nil {
+		choice.IsEnabled = *req.IsEnabled
+	}
+	db.DB.Save(&choice)
+	c.JSON(http.StatusOK, choice)
 }
 
 func DeleteOptionChoice(c *gin.Context) {
@@ -249,6 +456,16 @@ func DeleteOptionChoice(c *gin.Context) {
 // ค่าเริ่มต้นของกลุ่มตัวเลือกที่ตั้งไว้ระดับหมวดหมู่ เช่น หมวด "กาแฟ" ตั้ง "ความหวาน" ไว้ครั้งเดียว
 // แล้วนำไป "ใช้" (apply) กับเมนูแต่ละอย่างในหมวดนั้นได้ โดย copy เป็น MenuOptionGroup ของเมนูนั้นจริงๆ
 
+// ListAllCategoryOptionTemplates คืนกลุ่มตัวเลือก (template) ของทุกหมวดหมู่รวมกัน — ใช้กับหน้าแท็บ
+// "ตัวเลือกเสริม" ที่โชว์เป็นการ์ดรวมทุกกลุ่มในที่เดียว ไม่ต้องเลือกหมวดหมู่ก่อนถึงจะเห็น
+func ListAllCategoryOptionTemplates(c *gin.Context) {
+	var templates []models.CategoryOptionTemplate
+	db.DB.Preload("Choices").Order("sort_order asc").Find(&templates)
+	c.JSON(http.StatusOK, templates)
+}
+
+// ListCategoryOptionTemplates คืนเฉพาะ template ของหมวดหมู่เดียว — ใช้ตอนเปิดหน้าแก้ไขเมนูเพื่อโชว์
+// "ทางลัดใช้ค่าเริ่มต้นจากหมวดหมู่นี้" (กรองตามหมวดของเมนูที่กำลังแก้ไขอยู่)
 func ListCategoryOptionTemplates(c *gin.Context) {
 	categoryID := c.Param("id")
 	var templates []models.CategoryOptionTemplate
@@ -257,32 +474,54 @@ func ListCategoryOptionTemplates(c *gin.Context) {
 }
 
 type createCategoryOptionTemplateRequest struct {
-	Name       string `json:"name" binding:"required"`
-	IsRequired bool   `json:"is_required"`
-	Choices    []struct {
-		Name       string  `json:"name" binding:"required"`
-		PriceDelta float64 `json:"price_delta"`
-	} `json:"choices" binding:"required,min=1"`
+	CategoryID    uint                `json:"category_id" binding:"required"`
+	Name          string              `json:"name" binding:"required"`
+	Description   string              `json:"description"`
+	SelectionType string              `json:"selection_type"`
+	MinSelect     int                 `json:"min_select"`
+	MaxSelect     int                 `json:"max_select"`
+	IsRequired    bool                `json:"is_required"`
+	SortOrder     int                 `json:"sort_order"`
+	Choices       []optionChoiceInput `json:"choices" binding:"required,min=1"`
 }
 
+// CreateCategoryOptionTemplate สร้างกลุ่มตัวเลือก (template) ใหม่ ผูกกับหมวดหมู่ที่ระบุมาใน category_id
 func CreateCategoryOptionTemplate(c *gin.Context) {
-	categoryID := c.Param("id")
-	var category models.Category
-	if err := db.DB.First(&category, categoryID).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "category not found"})
-		return
-	}
-
 	var req createCategoryOptionTemplateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
+	var category models.Category
+	if err := db.DB.First(&category, req.CategoryID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "category not found"})
+		return
+	}
+
+	selectionType := req.SelectionType
+	if selectionType != "multi" {
+		selectionType = "single"
+	}
+	maxSelect := req.MaxSelect
+	if maxSelect <= 0 {
+		if selectionType == "multi" {
+			maxSelect = len(req.Choices)
+		} else {
+			maxSelect = 1
+		}
+	}
+
 	template := models.CategoryOptionTemplate{
-		CategoryID: category.ID,
-		Name:       req.Name,
-		IsRequired: req.IsRequired,
+		CategoryID:    category.ID,
+		Name:          req.Name,
+		Description:   req.Description,
+		SelectionType: selectionType,
+		MinSelect:     req.MinSelect,
+		MaxSelect:     maxSelect,
+		IsRequired:    req.IsRequired,
+		IsEnabled:     true,
+		SortOrder:     req.SortOrder,
 	}
 	if err := db.DB.Create(&template).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -295,12 +534,77 @@ func CreateCategoryOptionTemplate(c *gin.Context) {
 			Name:       ch.Name,
 			PriceDelta: ch.PriceDelta,
 			SortOrder:  i,
+			IsDefault:  ch.IsDefault,
+			IsEnabled:  true,
 		}
 		db.DB.Create(&choice)
 	}
 
 	db.DB.Preload("Choices").First(&template, template.ID)
 	c.JSON(http.StatusCreated, template)
+}
+
+type updateCategoryOptionTemplateRequest struct {
+	CategoryID    *uint   `json:"category_id"`
+	Name          *string `json:"name"`
+	Description   *string `json:"description"`
+	SelectionType *string `json:"selection_type"`
+	MinSelect     *int    `json:"min_select"`
+	MaxSelect     *int    `json:"max_select"`
+	IsRequired    *bool   `json:"is_required"`
+	IsEnabled     *bool   `json:"is_enabled"`
+	SortOrder     *int    `json:"sort_order"`
+}
+
+// UpdateCategoryOptionTemplate แก้ไขกลุ่มตัวเลือก (template) ที่มีอยู่แล้ว (ส่งเฉพาะฟิลด์ที่อยากแก้)
+func UpdateCategoryOptionTemplate(c *gin.Context) {
+	id := c.Param("id")
+	var template models.CategoryOptionTemplate
+	if err := db.DB.First(&template, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "option template not found"})
+		return
+	}
+
+	var req updateCategoryOptionTemplateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.CategoryID != nil {
+		template.CategoryID = *req.CategoryID
+	}
+	if req.Name != nil {
+		template.Name = *req.Name
+	}
+	if req.Description != nil {
+		template.Description = *req.Description
+	}
+	if req.SelectionType != nil {
+		if *req.SelectionType == "multi" {
+			template.SelectionType = "multi"
+		} else {
+			template.SelectionType = "single"
+		}
+	}
+	if req.MinSelect != nil {
+		template.MinSelect = *req.MinSelect
+	}
+	if req.MaxSelect != nil {
+		template.MaxSelect = *req.MaxSelect
+	}
+	if req.IsRequired != nil {
+		template.IsRequired = *req.IsRequired
+	}
+	if req.IsEnabled != nil {
+		template.IsEnabled = *req.IsEnabled
+	}
+	if req.SortOrder != nil {
+		template.SortOrder = *req.SortOrder
+	}
+	db.DB.Save(&template)
+
+	db.DB.Preload("Choices").First(&template, template.ID)
+	c.JSON(http.StatusOK, template)
 }
 
 func DeleteCategoryOptionTemplate(c *gin.Context) {
@@ -313,8 +617,86 @@ func DeleteCategoryOptionTemplate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
 }
 
+type addTemplateChoiceRequest struct {
+	Name       string  `json:"name" binding:"required"`
+	PriceDelta float64 `json:"price_delta"`
+	IsDefault  bool    `json:"is_default"`
+}
+
+// AddCategoryOptionTemplateChoice เพิ่มตัวเลือกย่อยใหม่เข้ากลุ่ม template ที่มีอยู่แล้ว
+func AddCategoryOptionTemplateChoice(c *gin.Context) {
+	templateID := c.Param("id")
+	var template models.CategoryOptionTemplate
+	if err := db.DB.First(&template, templateID).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "option template not found"})
+		return
+	}
+	var req addTemplateChoiceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	choice := models.CategoryOptionTemplateChoice{
+		TemplateID: template.ID,
+		Name:       req.Name,
+		PriceDelta: req.PriceDelta,
+		IsDefault:  req.IsDefault,
+		IsEnabled:  true,
+	}
+	if err := db.DB.Create(&choice).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, choice)
+}
+
+type updateTemplateChoiceRequest struct {
+	Name       *string  `json:"name"`
+	PriceDelta *float64 `json:"price_delta"`
+	IsDefault  *bool    `json:"is_default"`
+	IsEnabled  *bool    `json:"is_enabled"`
+}
+
+// UpdateCategoryOptionTemplateChoice แก้ไขตัวเลือกย่อยของ template ที่มีอยู่แล้ว
+func UpdateCategoryOptionTemplateChoice(c *gin.Context) {
+	id := c.Param("id")
+	var choice models.CategoryOptionTemplateChoice
+	if err := db.DB.First(&choice, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "choice not found"})
+		return
+	}
+	var req updateTemplateChoiceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Name != nil {
+		choice.Name = *req.Name
+	}
+	if req.PriceDelta != nil {
+		choice.PriceDelta = *req.PriceDelta
+	}
+	if req.IsDefault != nil {
+		choice.IsDefault = *req.IsDefault
+	}
+	if req.IsEnabled != nil {
+		choice.IsEnabled = *req.IsEnabled
+	}
+	db.DB.Save(&choice)
+	c.JSON(http.StatusOK, choice)
+}
+
+func DeleteCategoryOptionTemplateChoice(c *gin.Context) {
+	id := c.Param("id")
+	if err := db.DB.Delete(&models.CategoryOptionTemplateChoice{}, id).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
+}
+
 // ApplyOptionTemplateToMenuItem คัดลอก template ของหมวดหมู่ ไปสร้างเป็น MenuOptionGroup+Choices จริง
-// ของเมนูนั้นๆ (ไม่ได้ผูก reference ตรงๆ กับ template เพื่อไม่ให้แก้ template ทีหลังกระทบเมนูที่ apply ไปแล้ว)
+// ของเมนูนั้นๆ (ไม่ได้ผูก reference ตรงๆ กับ template เพื่อไม่ให้แก้ template ภายหลังไม่กระทบเมนูที่ apply ไปแล้ว)
 func ApplyOptionTemplateToMenuItem(c *gin.Context) {
 	menuItemID := c.Param("id")
 	templateID := c.Param("templateId")
@@ -332,9 +714,20 @@ func ApplyOptionTemplateToMenuItem(c *gin.Context) {
 	}
 
 	group := models.MenuOptionGroup{
-		MenuItemID: menuItem.ID,
-		Name:       template.Name,
-		IsRequired: template.IsRequired,
+		MenuItemID:    menuItem.ID,
+		Name:          template.Name,
+		Description:   template.Description,
+		SelectionType: template.SelectionType,
+		MinSelect:     template.MinSelect,
+		MaxSelect:     template.MaxSelect,
+		IsRequired:    template.IsRequired,
+		IsEnabled:     true,
+	}
+	if group.SelectionType == "" {
+		group.SelectionType = "single"
+	}
+	if group.MaxSelect <= 0 {
+		group.MaxSelect = 1
 	}
 	if err := db.DB.Create(&group).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -347,6 +740,8 @@ func ApplyOptionTemplateToMenuItem(c *gin.Context) {
 			Name:          ch.Name,
 			PriceDelta:    ch.PriceDelta,
 			SortOrder:     ch.SortOrder,
+			IsDefault:     ch.IsDefault,
+			IsEnabled:     true,
 		}
 		db.DB.Create(&choice)
 	}

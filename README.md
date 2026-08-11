@@ -33,8 +33,8 @@ curl http://localhost:8080/api/menu-items \
 ```
 main.go            จุดเริ่มต้น, ตั้งค่า route ทั้งหมด
 db/                 เชื่อมต่อฐานข้อมูล + auto-migrate
-models/             struct ของตาราง (User, Category, MenuItem, DiningTable, Order, OrderItem, Payment)
-handlers/           logic ของแต่ละ endpoint แยกตามหมวด (auth, menu, table, order, report)
+models/             struct ของตาราง (User, Category, MenuItem, DiningTable, Order, OrderItem, Payment, Member)
+handlers/           logic ของแต่ละ endpoint แยกตามหมวด (auth, menu, table, order, report, member)
 middleware/         ตรวจสอบ JWT token และสิทธิ์ admin
 utils/              สร้าง/ตรวจสอบ JWT
 seed/               ใส่ข้อมูลตัวอย่างตอนรันครั้งแรก
